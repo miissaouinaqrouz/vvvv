@@ -75,6 +75,234 @@ L'objectif est de construire un système **modulaire, évolutif et résilient**,
 
 ---
 
+## 1.5 Relations avec les autres microservices (Focus CRM)
+
+### 1.5.1 Vue d'ensemble des interactions inter-services
+
+Le **finance-service** ne fonctionne pas en isolation : il interagit avec plusieurs microservices de l'écosystème MAKA via **RabbitMQ** (asynchrone) et **REST** (synchrone, avec fallback).
+
+```
+┌────────────────┐         ┌──────────────────┐         ┌────────────────┐
+│  crm-service   │ ◄─────► │ finance-service  │ ◄─────► │ sales-service  │
+│  (C#/.NET)     │  events │ (Java/Spring)    │  events │ (Python)       │
+└────────────────┘         └──────────────────┘         └────────────────┘
+         ▲                          ▲                            ▲
+         │                          │                            │
+         │                          ▼                            │
+         │                 ┌──────────────────┐                  │
+         └────────────────►│    RabbitMQ      │◄─────────────────┘
+                           │  (Event Broker)  │
+                           └──────────────────┘
+```
+
+### 1.5.2 Relation Finance ↔ CRM (Détaillée)
+
+Le **crm-service** (C#/ASP.NET Core) gère la **relation client** (prospects, clients, contrats, historique d'interactions). Le finance-service en dépend pour :
+
+#### 🔹 A. Données nécessaires côté CRM
+
+| Donnée | Utilisation côté Finance |
+|--------|--------------------------|
+| `clientId` | Associer chaque facture à un client existant |
+| `clientName` | Affichage sur la facture |
+| `clientEmail` | Envoi automatique de la facture par email |
+| `clientAddress` | Adresse de facturation |
+| `taxNumber` (SIRET/TVA) | Mentions légales obligatoires |
+| `paymentTerms` | Délai de paiement (30j, 60j, etc.) |
+| `creditLimit` | Limite d'encours autorisée |
+
+#### 🔹 B. Flux d'intégration (événements RabbitMQ)
+
+**Événements consommés par finance-service (venant du CRM) :**
+
+| Événement | Routing Key | Action côté Finance |
+|-----------|-------------|---------------------|
+| `ClientCreated` | `crm.client.created` | Créer une vue locale du client (cache) |
+| `ClientUpdated` | `crm.client.updated` | Mettre à jour les infos client en cache |
+| `ClientDeleted` | `crm.client.deleted` | Marquer comme archivé (pas de suppression si factures existantes) |
+| `ContractSigned` | `crm.contract.signed` | Créer facture d'acompte automatique |
+| `OpportunityWon` | `crm.opportunity.won` | Pré-générer une facture en brouillon |
+
+**Événements publiés par finance-service (consommés par CRM) :**
+
+| Événement | Routing Key | Action côté CRM |
+|-----------|-------------|-----------------|
+| `InvoiceCreated` | `invoice.created` | Ajouter à l'historique client |
+| `InvoicePaid` | `invoice.paid` | Mettre à jour le statut financier du client |
+| `PaymentOverdue` | `payment.overdue` | Créer une alerte/relance automatique |
+| `ClientCreditExceeded` | `finance.credit.exceeded` | Bloquer nouveaux contrats |
+
+#### 🔹 C. Appels REST synchrones (avec Circuit Breaker)
+
+Lorsque la création d'une facture nécessite des infos client fraîches :
+
+```java
+@Service
+@RequiredArgsConstructor
+public class CrmClient {
+
+    private final RestClient restClient;
+
+    @CircuitBreaker(name = "crmService", fallbackMethod = "getClientFromCache")
+    @Retry(name = "crmService")
+    public ClientDTO getClient(Long clientId) {
+        return restClient.get()
+            .uri("http://crm-service:8080/api/clients/{id}", clientId)
+            .retrieve()
+            .body(ClientDTO.class);
+    }
+
+    // Fallback : utiliser le cache local si CRM indisponible
+    public ClientDTO getClientFromCache(Long clientId, Throwable ex) {
+        log.warn("CRM indisponible, utilisation du cache local pour client {}", clientId);
+        return clientCacheRepository.findById(clientId)
+            .orElseThrow(() -> new ClientNotAvailableException(clientId));
+    }
+}
+```
+
+#### 🔹 D. Modèle de données : extension de `Facture`
+
+La facture doit référencer un client du CRM. Ajout du champ `clientId` :
+
+```java
+@Entity
+@Table(name = "factures")
+public class Facture {
+    // ... champs existants ...
+
+    @Column(name = "client_id", nullable = false)
+    private Long clientId;  // ID du client dans le CRM
+
+    @Column(name = "client_name_snapshot", length = 255)
+    private String clientNameSnapshot;  // Nom au moment de la facturation (immuable)
+
+    @Column(name = "client_email_snapshot", length = 100)
+    private String clientEmailSnapshot;
+}
+```
+
+> **⚠️ Important — Snapshots** : Les informations client sont **snapshotées** au moment de la création de la facture pour respecter la réglementation comptable (une facture émise ne doit pas changer si le client modifie ses données).
+
+#### 🔹 E. Migration SQL pour la relation CRM
+
+```sql
+-- V9__add_client_reference_to_factures.sql
+ALTER TABLE factures 
+    ADD COLUMN client_id BIGINT NOT NULL,
+    ADD COLUMN client_name_snapshot VARCHAR(255),
+    ADD COLUMN client_email_snapshot VARCHAR(100),
+    ADD COLUMN client_tax_number_snapshot VARCHAR(50);
+
+CREATE INDEX idx_factures_client_id ON factures(client_id);
+
+-- Table de cache des clients (dégrade gracieusement si CRM indisponible)
+CREATE TABLE client_cache (
+    id              BIGINT PRIMARY KEY,
+    name            VARCHAR(255) NOT NULL,
+    email           VARCHAR(100),
+    address         TEXT,
+    tax_number      VARCHAR(50),
+    payment_terms   INTEGER DEFAULT 30,
+    credit_limit    DECIMAL(15,2),
+    last_sync_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_client_cache_email ON client_cache(email);
+```
+
+#### 🔹 F. Consommateur d'événements CRM
+
+```java
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class CrmEventConsumer {
+
+    private final ClientCacheRepository clientCacheRepository;
+    private final FactureService factureService;
+
+    @RabbitListener(queues = "finance.crm.events")
+    public void onCrmEvent(CrmEvent event) {
+        log.info("Received CRM event: {}", event.getEventType());
+
+        switch (event.getEventType()) {
+            case "ClientCreated", "ClientUpdated" -> {
+                ClientDTO client = (ClientDTO) event.getPayload();
+                ClientCache cache = ClientCache.builder()
+                    .id(client.getId())
+                    .name(client.getName())
+                    .email(client.getEmail())
+                    .address(client.getAddress())
+                    .taxNumber(client.getTaxNumber())
+                    .paymentTerms(client.getPaymentTerms())
+                    .creditLimit(client.getCreditLimit())
+                    .lastSyncAt(LocalDateTime.now())
+                    .build();
+                clientCacheRepository.save(cache);
+            }
+            case "ContractSigned" -> {
+                ContractDTO contract = (ContractDTO) event.getPayload();
+                // Créer automatiquement une facture d'acompte (30%)
+                factureService.creerFactureAcompte(contract);
+            }
+            case "OpportunityWon" -> {
+                OpportunityDTO opp = (OpportunityDTO) event.getPayload();
+                // Créer une facture en brouillon
+                factureService.creerFactureBrouillon(opp);
+            }
+        }
+    }
+}
+```
+
+#### 🔹 G. Scénario complet : De l'opportunité CRM au paiement
+
+```
+1. [CRM]     Commercial gagne une opportunité 
+             → publie "OpportunityWon" sur RabbitMQ
+                    ↓
+2. [FINANCE] Consomme l'événement
+             → crée une facture en statut BROUILLON
+             → notifie le comptable
+                    ↓
+3. [FINANCE] Comptable valide la facture (BROUILLON → VALIDEE → ENVOYEE)
+             → publie "InvoiceCreated"
+                    ↓
+4. [CRM]     Consomme "InvoiceCreated"
+             → ajoute l'entrée à l'historique client
+             → met à jour le chiffre d'affaires prévisionnel
+                    ↓
+5. [FINANCE] Client paie → Paiement enregistré
+             → publie "InvoicePaid"
+                    ↓
+6. [CRM]     Consomme "InvoicePaid"
+             → met à jour le statut "bon payeur" du client
+             → débloque de nouvelles opportunités si credit_limit libéré
+```
+
+#### 🔹 H. Tableau de dépendances
+
+| Module Finance | Dépend de CRM pour | Niveau de couplage |
+|----------------|---------------------|---------------------|
+| Création facture | `clientId`, infos facturation | 🔴 Fort (snapshot) |
+| Validation facture | `creditLimit` | 🟡 Moyen (vérification) |
+| Relance impayés | `clientEmail`, `paymentTerms` | 🟡 Moyen (cache OK) |
+| Comptabilité | Aucune (autonome) | 🟢 Aucun |
+| Rapports | `clientName` pour affichage | 🟢 Faible (cache OK) |
+
+### 1.5.3 Relations avec les autres microservices
+
+| Service | Rôle | Interactions Finance |
+|---------|------|---------------------|
+| **crm-service** | Gestion clients | ⬆️ Détaillé ci-dessus |
+| **sales-service** | Ventes & devis | `SaleConfirmed` → créer facture |
+| **stock-service** | Inventaire | `StockOut` → ajuster facture si rupture |
+| **hr-service** | RH & paie | `SalaryPaid` → écriture comptable |
+| **auth-service** | Authentification | Validation JWT à chaque requête |
+
+---
+
 ## 2. Architecture globale
 
 ### 2.1 Les 9 composants essentiels
